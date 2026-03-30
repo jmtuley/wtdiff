@@ -21,7 +21,6 @@ Keys:
 
 import argparse
 import configparser
-import json
 import os
 import shutil
 import subprocess
@@ -118,35 +117,7 @@ def detect_default_branch(git_root: Path) -> str:
 
 
 def load_worktrees(git_root: Path, base: str) -> list[dict]:
-    """Return list of worktree dicts. Prefers `wt list --format=json`."""
-    if shutil.which("wt"):
-        r = subprocess.run(
-            ["wt", "list", "--format=json"],
-            capture_output=True, text=True,
-            cwd=str(git_root),
-        )
-        if r.returncode == 0:
-            try:
-                raw = json.loads(r.stdout)
-            except json.JSONDecodeError:
-                raw = []
-            result = []
-            for item in raw:
-                if item.get("kind") == "branch" and not item.get("path"):
-                    continue
-                branch = item.get("branch") or "(detached)"
-                path = item.get("path") or str(git_root)
-                is_main = bool(item.get("is_main"))
-                wt_info = item.get("working_tree") or {}
-                symbols = _status_symbols(wt_info)
-                main_info = item.get("main") or {}
-                ahead = int(main_info.get("ahead") or 0)
-                behind = int(main_info.get("behind") or 0)
-                result.append(_wt_entry(branch, path, is_main, symbols, ahead, behind, base))
-            if result:
-                return result
-
-    # Fallback: parse git worktree list --porcelain
+    """Return list of worktree dicts from git worktree list."""
     r = subprocess.run(
         ["git", "-C", str(git_root), "worktree", "list", "--porcelain"],
         capture_output=True, text=True,
@@ -182,13 +153,6 @@ def _wt_entry(branch, path, is_main, symbols, ahead, behind, base) -> dict:
     }
 
 
-def _status_symbols(wt_info: dict) -> str:
-    s = ""
-    if wt_info.get("staged"):    s += "+"
-    if wt_info.get("modified"):  s += "!"
-    if wt_info.get("untracked"): s += "?"
-    return s
-
 
 def format_label(wt: dict) -> str:
     parts = [wt["branch"]]
@@ -220,6 +184,25 @@ def default_tool(cfg=None) -> str:
     return available_tools()[0]
 
 
+def _untracked_diff(wt_path: str, file_path: str) -> str:
+    """Return a git diff --no-index patch for a single untracked file."""
+    abs_path = str(Path(wt_path) / file_path)
+    r = subprocess.run(
+        ["git", "diff", "--no-index", "--", "/dev/null", abs_path],
+        capture_output=True, text=True, errors="replace",
+    )
+    return r.stdout  # exit code 1 is normal for diff --no-index with differences
+
+
+def _untracked_diff_color(wt_path: str, file_path: str) -> str:
+    abs_path = str(Path(wt_path) / file_path)
+    r = subprocess.run(
+        ["git", "diff", "--no-index", "--color=always", "--", "/dev/null", abs_path],
+        capture_output=True, text=True, errors="replace",
+    )
+    return r.stdout
+
+
 def build_diff(wt_path: str, base: str, mode: str, tool: str, cfg=None, file_path: str = None) -> str:
     """
     mode='branch' — git diff <base>...HEAD  (all commits on the branch)
@@ -227,6 +210,32 @@ def build_diff(wt_path: str, base: str, mode: str, tool: str, cfg=None, file_pat
     """
     is_difft = tool in ("difft",) or tool.endswith("difft")
     range_arg = f"{base}...HEAD" if mode == "branch" else "HEAD"
+
+    # Single untracked file selected — use --no-index diff
+    if file_path:
+        untracked = {p for p in subprocess.run(
+            ["git", "-C", wt_path, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True,
+        ).stdout.splitlines() if p}
+        if file_path in untracked:
+            raw = _untracked_diff(wt_path, file_path)
+            if not raw.strip():
+                return "(empty file)"
+            if is_difft:
+                return raw  # difft doesn't post-process plain patches
+            colored = _untracked_diff_color(wt_path, file_path)
+            if tool == "delta":
+                extra = _tool_env(cfg, "delta")
+                env = {**os.environ, **extra} if extra else None
+                p = subprocess.run(["delta"], input=colored, capture_output=True, text=True, errors="replace", env=env)
+                return p.stdout or colored
+            if tool == "diff-so-fancy":
+                extra = _tool_env(cfg, "diff-so-fancy")
+                env = {**os.environ, **extra} if extra else None
+                p = subprocess.run(["diff-so-fancy"], input=colored, capture_output=True, text=True, errors="replace", env=env)
+                return p.stdout or colored
+            return colored
+
     file_args = ["--", file_path] if file_path else []
 
     if is_difft:
@@ -239,6 +248,10 @@ def build_diff(wt_path: str, base: str, mode: str, tool: str, cfg=None, file_pat
             capture_output=True, text=True, env=env, errors="replace",
         )
         out = r.stdout
+        # Append untracked file diffs (no-index, plain — difft won't pipe)
+        if not file_path:
+            for uf in load_untracked(wt_path):
+                out += _untracked_diff(wt_path, uf["path"])
         if not out.strip():
             return f"(no changes vs {base})" if mode == "branch" else "(no uncommitted changes)"
         return out
@@ -248,6 +261,11 @@ def build_diff(wt_path: str, base: str, mode: str, tool: str, cfg=None, file_pat
         capture_output=True, text=True, errors="replace",
     )
     diff_out = r.stdout
+
+    # Append untracked file diffs for full-worktree view
+    if not file_path:
+        for uf in load_untracked(wt_path):
+            diff_out += _untracked_diff_color(wt_path, uf["path"])
 
     if not diff_out.strip():
         return f"(no changes vs {base})" if mode == "branch" else "(no uncommitted changes)"
@@ -267,6 +285,15 @@ def build_diff(wt_path: str, base: str, mode: str, tool: str, cfg=None, file_pat
     return diff_out
 
 
+def load_untracked(wt_path: str) -> list[dict]:
+    """Return untracked (not ignored) files as status '?' entries."""
+    r = subprocess.run(
+        ["git", "-C", wt_path, "ls-files", "--others", "--exclude-standard"],
+        capture_output=True, text=True,
+    )
+    return [{"status": "?", "path": p} for p in r.stdout.splitlines() if p]
+
+
 def load_files(wt_path: str, base: str, mode: str) -> list[dict]:
     range_arg = f"{base}...HEAD" if mode == "branch" else "HEAD"
     r = subprocess.run(
@@ -282,6 +309,7 @@ def load_files(wt_path: str, base: str, mode: str) -> list[dict]:
         status = raw_status[0]
         path = parts[2] if status == "R" and len(parts) >= 3 else parts[1]
         files.append({"status": status, "path": path})
+    files.extend(load_untracked(wt_path))
     return files
 
 
@@ -305,6 +333,7 @@ class WtdiffApp:
         "file-modified":"fg:ansiyellow",
         "file-deleted": "fg:ansired",
         "file-renamed": "fg:ansicyan",
+        "file-untracked": "fg:ansimagenta",
         "":             "",
     })
 
@@ -323,6 +352,7 @@ class WtdiffApp:
         self._view = "worktrees"   # "worktrees" | "files"
         self._files: list[dict] = []
         self._file_idx = 0
+        self._loading = True
 
         self._app = Application(
             layout=self._build_layout(),
@@ -382,9 +412,12 @@ class WtdiffApp:
         "M": "class:file-modified",
         "D": "class:file-deleted",
         "R": "class:file-renamed",
+        "?": "class:file-untracked",
     }
 
     def _render_list(self):
+        if self._loading:
+            return [("", " Loading…\n")]
         if self._view == "files":
             return self._render_file_list()
         items = []
@@ -518,20 +551,28 @@ class WtdiffApp:
         self._back_to_worktrees()
         self._load_diff()
 
+    def _bg_reload(self) -> None:
+        self._reload_worktrees()
+        self._loading = False
+        self._app.invalidate()
+
     # ------------------------------------------------------------------
     # Key bindings
     # ------------------------------------------------------------------
 
     def _build_keys(self) -> KeyBindings:
         kb = KeyBindings()
+        nf = ~self._is_filtering()   # not in filter mode
+        nl = ~self._is_loading()     # not loading
+        bf = self._is_browsing_files()
 
         # -- Quit --
-        @kb.add("q", filter=~self._is_filtering())
+        @kb.add("q", filter=nf)
         def _quit(event): event.app.exit()
 
         # -- List navigation --
-        @kb.add("up",   filter=~self._is_filtering())
-        @kb.add("k",    filter=~self._is_filtering())
+        @kb.add("up",   filter=nf & nl)
+        @kb.add("k",    filter=nf & nl)
         def _up(event):
             if self._view == "files":
                 if self._file_idx > -1:
@@ -542,8 +583,8 @@ class WtdiffApp:
                     self._idx -= 1
                     self._load_diff()
 
-        @kb.add("down", filter=~self._is_filtering())
-        @kb.add("j",    filter=~self._is_filtering())
+        @kb.add("down", filter=nf & nl)
+        @kb.add("j",    filter=nf & nl)
         def _down(event):
             if self._view == "files":
                 if self._file_idx < len(self._files) - 1:
@@ -555,42 +596,42 @@ class WtdiffApp:
                     self._idx += 1
                     self._load_diff()
 
-        @kb.add("enter", filter=~self._is_filtering() & ~self._is_browsing_files())
+        @kb.add("enter", filter=nf & nl & ~bf)
         def _drill_in(event):
             self._load_files()
 
-        @kb.add("enter", filter=~self._is_filtering() & self._is_browsing_files())
+        @kb.add("enter", filter=nf & bf)
         def _files_enter(event):
             if self._file_idx == -1:
                 self._back_to_worktrees()
 
         # -- Diff scroll --
-        @kb.add("J",    filter=~self._is_filtering())
-        @kb.add("pagedown", filter=~self._is_filtering())
+        @kb.add("J",    filter=nf & nl)
+        @kb.add("pagedown", filter=nf & nl)
         def _scroll_down(event):
             self._diff_scroll = min(
                 self._diff_scroll + 10,
                 max(0, len(self._diff_lines) - 1),
             )
 
-        @kb.add("K",    filter=~self._is_filtering())
-        @kb.add("pageup", filter=~self._is_filtering())
+        @kb.add("K",    filter=nf & nl)
+        @kb.add("pageup", filter=nf & nl)
         def _scroll_up(event):
             self._diff_scroll = max(0, self._diff_scroll - 10)
 
-        @kb.add("c-d",  filter=~self._is_filtering())
+        @kb.add("c-d",  filter=nf & nl)
         def _half_down(event):
             self._diff_scroll = min(
                 self._diff_scroll + 20,
                 max(0, len(self._diff_lines) - 1),
             )
 
-        @kb.add("c-u",  filter=~self._is_filtering())
+        @kb.add("c-u",  filter=nf & nl)
         def _half_up(event):
             self._diff_scroll = max(0, self._diff_scroll - 20)
 
         # -- Mode --
-        @kb.add("d",    filter=~self._is_filtering())
+        @kb.add("d",    filter=nf & nl)
         def _branch(event):
             self._mode = "branch"
             if self._view == "files":
@@ -598,7 +639,7 @@ class WtdiffApp:
             else:
                 self._load_diff()
 
-        @kb.add("u",    filter=~self._is_filtering())
+        @kb.add("u",    filter=nf & nl)
         def _dirty(event):
             self._mode = "dirty"
             if self._view == "files":
@@ -607,7 +648,7 @@ class WtdiffApp:
                 self._load_diff()
 
         # -- Refresh --
-        @kb.add("t",    filter=~self._is_filtering())
+        @kb.add("t",    filter=nf & nl)
         def _cycle_tool(event):
             tools = available_tools()
             try:
@@ -617,12 +658,14 @@ class WtdiffApp:
             self._tool = tools[(idx + 1) % len(tools)]
             self._load_diff()
 
-        @kb.add("r",    filter=~self._is_filtering())
+        @kb.add("r",    filter=nf & nl)
         def _refresh(event):
-            self._reload_worktrees()
+            self._loading = True
+            import threading
+            threading.Thread(target=self._bg_reload, daemon=True).start()
 
         # -- Filter mode (worktrees view only) --
-        @kb.add("/",    filter=~self._is_filtering() & ~self._is_browsing_files())
+        @kb.add("/",    filter=nf & nl & ~bf)
         def _start_filter(event):
             self._filter_mode = True
 
@@ -634,10 +677,11 @@ class WtdiffApp:
             self._filter = ""
             self._filter_mode = False
             self._idx = 0
-            self._load_diff()
+            if not self._loading:
+                self._load_diff()
 
-        @kb.add("h",    filter=~self._is_filtering())
-        @kb.add("left", filter=~self._is_filtering())
+        @kb.add("h",    filter=nf & nl)
+        @kb.add("left", filter=nf & nl)
         def _back(event):
             if self._view == "files":
                 self._back_to_worktrees()
@@ -663,21 +707,24 @@ class WtdiffApp:
         return kb
 
     def _is_filtering(self):
-        """prompt_toolkit filter condition for filter mode."""
         from prompt_toolkit.filters import Condition
         return Condition(lambda: self._filter_mode)
 
     def _is_browsing_files(self):
-        """prompt_toolkit filter condition for files view."""
         from prompt_toolkit.filters import Condition
         return Condition(lambda: self._view == "files")
+
+    def _is_loading(self):
+        from prompt_toolkit.filters import Condition
+        return Condition(lambda: self._loading)
 
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        self._reload_worktrees()
+        import threading
+        threading.Thread(target=self._bg_reload, daemon=True).start()
         self._app.run()
 
 

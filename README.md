@@ -8,6 +8,8 @@ Browse diffs across all your [worktrunk](https://worktrunk.dev) git worktrees fr
                         │ +  def new_method
 ```
 
+Tracked changes and **untracked files** are both shown — untracked files appear in the file list with `?` status and display as a full-file diff.
+
 ## Requirements
 
 - Python 3.9+
@@ -54,7 +56,7 @@ wtdiff
 | `J` `K` | Scroll diff up/down |
 | `Ctrl-d` / `Ctrl-u` | Half-page scroll |
 | `d` | Branch diff — all commits on this branch vs base |
-| `u` | Uncommitted diff — `git diff HEAD` (default) |
+| `u` | Uncommitted diff — `git diff HEAD` + untracked files (default) |
 | `t` | Cycle diff tool |
 | `/` | Filter worktree list |
 | `Esc` | Clear filter |
