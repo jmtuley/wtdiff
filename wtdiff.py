@@ -212,7 +212,7 @@ def _untracked_diff_color(wt_path: str, file_path: str) -> str:
 def _bat_render_new_file(wt_path: str, file_path: str) -> str:
     abs_path = str(Path(wt_path) / file_path)
     r = subprocess.run(
-        ["bat", "--color=always", "--paging=never", "--style=plain", abs_path],
+        ["bat", "--color=always", "--paging=never", "--style=plain", "--theme=ansi", abs_path],
         capture_output=True, text=True, errors="replace",
     )
     notice = f"\x1b[1;32m(new file)\x1b[0m {file_path}\n"

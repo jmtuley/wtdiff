@@ -75,6 +75,7 @@ def test_bat_render_new_file_invokes_bat_with_color_and_no_paging():
     assert cmd[0] == "bat"
     assert "--color=always" in cmd
     assert "--paging=never" in cmd
+    assert "--theme=ansi" in cmd
 
 
 # ---------------------------------------------------------------------------
